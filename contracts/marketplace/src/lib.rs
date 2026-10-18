@@ -84,6 +84,20 @@ pub struct Offer {
     pub expires_at: Option<u64>,
 }
 
+/// Aggregate marketplace statistics returned by `get_marketplace_stats`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MarketplaceStats {
+    /// Total number of offers ever created (including closed/cancelled).
+    pub total_offers: u64,
+    /// Number of currently active (open, non-expired) offers.
+    pub active_offers: u64,
+    /// Cumulative XLM volume (in stroops) across all completed buy_offer calls.
+    pub total_volume_xlm: i128,
+    /// Cumulative token volume per token address for SAC-token-based offers.
+    pub total_volume_tokens: Map<Address, i128>,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -412,6 +426,13 @@ impl Marketplace {
             return Err(MarketplaceError::InvalidTonnes);
         }
 
+        // #1092: validate expires_at is strictly in the future
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+        }
+
         let registry_nonce: u64 = env.invoke_contract(
             &registry_id,
             &Symbol::new(&env, "get_nonce"),
@@ -476,7 +497,11 @@ impl Marketplace {
         if ids.len() >= 50 {
             let mut pruned = Vec::new(&env);
             for id in ids.iter() {
-                if let Some(o) = env.storage().persistent().get::<_, Offer>(&DataKey::Offer(id)) {
+                if let Some(o) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Offer>(&DataKey::Offer(id))
+                {
                     if o.active {
                         pruned.push_back(id);
                     }
@@ -639,6 +664,9 @@ impl Marketplace {
                 .persistent()
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
+
+        // #1091: decrement active offers counter
+        Self::decrement_active_count(&env);
 
         OfferCxl {
             seller: seller.clone(),
@@ -813,9 +841,11 @@ impl Marketplace {
                                 env.storage().persistent().remove(&seller_key);
                             } else {
                                 env.storage().persistent().set(&seller_key, &seller_ids);
-                                env.storage()
-                                    .persistent()
-                                    .extend_ttl(&seller_key, TTL_THRESHOLD, MIN_TTL);
+                                env.storage().persistent().extend_ttl(
+                                    &seller_key,
+                                    TTL_THRESHOLD,
+                                    MIN_TTL,
+                                );
                             }
                         }
                     }
@@ -1080,6 +1110,38 @@ impl Marketplace {
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
 
+        // #1091: decrement active offers counter and accumulate volume
+        Self::decrement_active_count(&env);
+        // All marketplace offers are priced in native XLM (price_xlm in stroops).
+        // Accumulate into TotalVolumeXLM; TotalVolumeTokens tracks SAC-token-based
+        // volume if token_id differs from the native XLM contract in future extensions.
+        let prev_xlm_vol: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeXLM)
+            .unwrap_or(0i128);
+        let new_xlm_vol = prev_xlm_vol.saturating_add(price);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeXLM, &new_xlm_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeXLM, TTL_THRESHOLD, MIN_TTL);
+        // Also record per-token volume so callers can distinguish native XLM vs SAC tokens.
+        let mut token_vol: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeTokens)
+            .unwrap_or_else(|| Map::new(&env));
+        let prev_tok_vol: i128 = token_vol.get(token_id.clone()).unwrap_or(0i128);
+        token_vol.set(token_id, prev_tok_vol.saturating_add(price));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeTokens, &token_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeTokens, TTL_THRESHOLD, MIN_TTL);
+
         Ok(())
     }
 
@@ -1150,6 +1212,38 @@ impl Marketplace {
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// Increment `ActiveOffersCount` by one. Called when a new active offer is created.
+    fn increment_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
+
+    /// Decrement `ActiveOffersCount` by one (saturating at zero). Called on cancel or buy.
+    fn decrement_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
 
     fn next_id(env: &Env) -> Result<u64, MarketplaceError> {
         let id: u64 = env
